@@ -1,65 +1,107 @@
-# sentiment.py
-# trying to build something that reads oil news and figures out if it's bullish or bearish
-# started this after reading about quantitative finance on reddit lol
-# very basic for now, will improve
-
+import hashlib
+import math
 import time
-
-# keywords that usually mean price goes up
-BULLISH = ["cut", "shortage", "rally", "surge", "buy", "up", "increase", "deficit", "bullish"]
-# keywords that usually mean price goes down  
-BEARISH = ["glut", "drop", "sell", "down", "decrease", "crash", "oversupply", "bearish"]
+from dataclasses import dataclass
 
 
-def get_sentiment(text):
-    words = text.lower().split()
-    
-    pos = 0
-    neg = 0
-    
-    for word in words:
-        # strip punctuation manually (TODO: use regex later)
-        word = word.strip(".,!?;:")
-        if word in BULLISH:
-            pos += 1
-        if word in BEARISH:
-            neg += 1
-    
-    # this breaks if text is empty, fix later
-    score = (pos - neg) / len(words)
-    return score
+BULLISH = [
+    "cut", "shortage", "rally", "surge", "buy", "increase",
+    "deficit", "bullish", "strong", "underproduction"
+]
+BEARISH = [
+    "glut", "drop", "sell", "decrease", "crash",
+    "oversupply", "bearish", "weak", "flood"
+]
 
 
-def process_signal(tweet_text, source, followers):
-    score = get_sentiment(tweet_text)
-    
-    print(f"[{source}] followers={followers}")
-    print(f"  text: {tweet_text[:80]}")
-    print(f"  sentiment score: {score:.4f}")
-    print(f"  direction: {'BULLISH' if score > 0 else 'BEARISH' if score < 0 else 'NEUTRAL'}")
-    print()
-    
-    return score
+@dataclass
+class Signal:
+    uid: str
+    source: str
+    followers: int
+    text: str
+    raw_score: float
+    weighted_score: float
+    direction: str
+    timestamp: float
+    is_duplicate: bool = False
 
 
-# test with some fake tweets
+def keyword_score(text):
+    if not text or not text.strip():
+        return 0.0
+
+    words = [w.strip(".,!?;:") for w in text.lower().split()]
+    pos = sum(1 for w in words if w in BULLISH)
+    neg = sum(1 for w in words if w in BEARISH)
+    total = pos + neg
+
+    if total == 0:
+        return 0.0
+
+    return (pos - neg) / total
+
+
+def follower_weight(n):
+    # not sure log is the right scale here but linear felt wrong
+    # reuters at 2M was completely drowning out everyone else
+    return min(math.log10(max(n, 1) + 1) / 7.0, 1.0)
+
+
+class SignalProcessor:
+    def __init__(self):
+        self._seen = set()
+
+    def process(self, text, source, followers):
+        uid = hashlib.md5(text.lower().strip().encode()).hexdigest()[:8]
+        h = hashlib.md5(text.lower().strip().encode()).hexdigest()
+
+        is_dup = h in self._seen
+        if not is_dup:
+            self._seen.add(h)
+
+        raw = keyword_score(text)
+        w = follower_weight(followers)
+        weighted = raw * w
+
+        if weighted > 0.08:
+            direction = "BULLISH"
+        elif weighted < -0.08:
+            direction = "BEARISH"
+        else:
+            direction = "NEUTRAL"
+
+        return Signal(
+            uid=uid,
+            source=source,
+            followers=followers,
+            text=text,
+            raw_score=raw,
+            weighted_score=weighted,
+            direction=direction,
+            timestamp=time.time(),
+            is_duplicate=is_dup,
+        )
+
+
 if __name__ == "__main__":
-    signals = [
-        ("Reuters",         2000000, "OPEC cuts oil production, supply deficit expected, bullish outlook"),
-        ("oil_trader_anon", 3500,    "massive crash incoming, oversupply everywhere, very bearish"),
-        ("noise_account",   50,      "just had my morning coffee"),
-        ("aramco_engineer", 200,     "pipeline maintenance will cause supply shortage next week"),
-        ("generic_bot",     800000,  "oil price up today, bullish"),
+    proc = SignalProcessor()
+
+    cases = [
+        ("Reuters",         2_000_000, "OPEC cuts oil production, supply deficit bullish"),
+        ("oil_trader_anon", 3_500,     "massive crash incoming, oversupply bearish"),
+        ("noise_account",   50,        "just had my morning coffee"),
+        ("aramco_engineer", 200,       "pipeline maintenance will cause supply shortage"),
+        ("generic_bot_1",   800_000,   "oil price up today bullish"),
+        ("generic_bot_2",   750_000,   "oil price up today bullish"),
+        ("empty",           1_000,     ""),
     ]
-    
-    print("=== SENSE-ACT v0.1 ===")
-    print()
-    
-    results = []
-    for source, followers, text in signals:
-        score = process_signal(text, source, followers)
-        results.append((source, followers, score))
-    
-    print("--- Summary ---")
-    for source, followers, score in results:
-        print(f"  {source}: {score:+.4f}")
+
+    print("=== sense-act ===\n")
+
+    for source, followers, text in cases:
+        s = proc.process(text, source, followers)
+        flag = " [dup]" if s.is_duplicate else ""
+        print(f"{source}{flag}")
+        print(f"  raw={s.raw_score:+.3f}  w={follower_weight(followers):.2f}  "
+              f"weighted={s.weighted_score:+.3f}  {s.direction}")

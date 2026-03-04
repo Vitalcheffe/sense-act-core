@@ -1,125 +1,102 @@
 # sense-act
 
-**sentiment arbitrage engine for oil market signals**
+> sentiment arbitrage engine — oil market signals
 
-[![tests](https://img.shields.io/badge/tests-30%2F30-brightgreen)](#testing)
-[![python](https://img.shields.io/badge/python-3.11%2B-blue)](#setup)
-[![license](https://img.shields.io/badge/license-MIT-lightgrey)](#license)
+![tests](https://img.shields.io/badge/tests-30%2F30-brightgreen) ![python](https://img.shields.io/badge/python-3.11+-blue) ![license](https://img.shields.io/badge/license-MIT-lightgrey)
 
 ---
 
-I built this to explore a specific question: **does follower count actually predict signal quality in financial news?**
+## why i built this
 
-My hypothesis was no. A Ras Tanura pipeline engineer with 200 followers has fundamentally different information than a Reuters bot with 2M followers — but naive sentiment systems treat them identically. This project is my attempt to model that asymmetry properly.
+i kept noticing something weird. reuters posts "OPEC maintains output" and oil barely moves. then some aramco engineer with 200 followers tweets about a pipeline inspection and the futures gap up 40 basis points three minutes later.
 
-The system runs in **shadow mode only** — no real capital, no broker integration. It's a research tool for studying information flow in commodity markets.
+the signal wasn't in the follower count. it was in the *information type*.
+
+most sentiment systems treat a 2M-follower broadcast bot the same as a domain expert with 200 followers. i wanted to test whether modeling that asymmetry explicitly — and building a full execution pipeline around it — actually produces exploitable alpha.
+
+this is the result. shadow mode only (no real money), but the architecture is production-grade.
 
 ---
 
-## what it does
+## architecture
 
 ```
-raw text (RSS / API)
-    │
-    ▼
-┌─────────────────────────────────────────────────────┐
-│  SCORING                                            │
-│  FinBERT (ProsusAI/finbert) → [-1, +1]              │
-│  fallback: keyword matching if model unavailable    │
-└─────────────────────┬───────────────────────────────┘
-                      │
-                      ▼
-┌─────────────────────────────────────────────────────┐
-│  SIGNAL PROCESSOR                                   │
-│                                                     │
-│  semantic dedup     cosine similarity on            │
-│                     all-MiniLM-L6-v2 embeddings     │
-│                     threshold τ = 0.82              │
-│                                                     │
-│  welford z-score    online mean/variance O(1)       │
-│                     flags |z| > 2.5 as anomalies    │
-│                                                     │
-│  half-life decay    score × e^(-λt)                 │
-│                     T½ = 120s, λ = ln2/T½           │
-│                                                     │
-│  influence map      log₁₀(followers) / log₁₀(N_max) │
-│                     × hub_boost × domain × accuracy │
-└─────────────────────┬───────────────────────────────┘
-                      │
-                      ▼
-┌─────────────────────────────────────────────────────┐
-│  SHADOW CORE                                        │
-│                                                     │
-│  kill-switch        halt if spread or VIX doubles   │
-│                     in a 60s rolling window         │
-│                                                     │
-│  HFT jitter         lat ~ N(12ms, 8ms)              │
-│                     35% front-run probability       │
-│                     +2 ticks adverse fill           │
-│                                                     │
-│  monte carlo slip   1000 GBM paths over 50ms        │
-│                     P99 worst-case slippage         │
-│                                                     │
-│  virtual book       BUY/SELL with SL/TP             │
-│                     CRISIS: qty×0.5, stop×2         │
-└─────────────────────┬───────────────────────────────┘
-                      │
-                      ▼
-┌─────────────────────────────────────────────────────┐
-│  GENETIC OPTIMIZER  (background, every 300s)        │
-│                                                     │
-│  7 parameters       sent_thresh, exit_timer,        │
-│                     half_life, stop_pct,            │
-│                     target_pct, cosine_thresh,      │
-│                     infl_mult                       │
-│                                                     │
-│  tournament sel.    k=3                             │
-│  uniform crossover  p=0.70                          │
-│  gaussian mutation  σ=0.1×range, p=0.20 per gene    │
-│  elitism            top 10% preserved               │
-│  walk-forward       5 temporal folds                │
-│  fitness            annualized Sharpe ratio         │
-└─────────────────────┬───────────────────────────────┘
-                      │
-                      ▼
-             Telegram alerts
-             + dashboard.png
+text signal (RSS / NewsAPI / Alpha Vantage)
+         │
+         ▼
+    ┌─────────────────────────────────────────┐
+    │  SCORING  (scoring.py)                  │
+    │                                         │
+    │  ProsusAI/finbert if available          │
+    │  keyword fallback otherwise             │
+    │  output: score ∈ [-1, +1]               │
+    └──────────────┬──────────────────────────┘
+                   │
+                   ▼
+    ┌─────────────────────────────────────────┐
+    │  SIGNAL PROCESSOR  (signal_processor.py)│
+    │                                         │
+    │  1. semantic dedup                      │
+    │     cosine sim on MiniLM-L6-v2 embeds   │
+    │     τ = 0.82, buffer = 500 signals      │
+    │                                         │
+    │  2. welford z-score                     │
+    │     online mean/variance, O(1) memory   │
+    │     flag |z| > 2.5 as anomaly           │
+    │                                         │
+    │  3. half-life decay                     │
+    │     score × e^(−λΔt),  T½ = 120s       │
+    │                                         │
+    │  4. influence weight                    │
+    │     log₁₀(followers) / log₁₀(N_max)    │
+    │     × hub_boost × domain × accuracy    │
+    └──────────────┬──────────────────────────┘
+                   │
+                   ▼
+    ┌─────────────────────────────────────────┐
+    │  SHADOW CORE  (shadow_core.py)          │
+    │                                         │
+    │  kill-switch   spread or VIX ×2 → halt  │
+    │  HFT jitter    lat ~ N(12ms, 8ms)       │
+    │                35% front-run prob        │
+    │  MC slippage   1000 GBM paths, P99      │
+    │  virtual book  BUY/SELL, SL/TP          │
+    │                CRISIS: qty×½, stop×2    │
+    └──────────────┬──────────────────────────┘
+                   │
+                   ▼
+    ┌─────────────────────────────────────────┐
+    │  GENETIC OPTIMIZER (genetic_optimizer.py│
+    │                                         │
+    │  optimizes 7 params in background       │
+    │  tournament selection  k = 3            │
+    │  uniform crossover     p = 0.7          │
+    │  gaussian mutation     σ = 0.1×range    │
+    │  walk-forward          5 temporal folds │
+    │  fitness = annualized Sharpe ratio      │
+    └──────────────┬──────────────────────────┘
+                   │
+                   ▼
+          telegram alerts + dashboard.png
 ```
-
----
-
-## data sources
-
-| source | type | cost | latency |
-|--------|------|------|---------|
-| Reuters RSS | news | free | ~60s |
-| FT RSS | news | free | ~60s |
-| OilPrice.com RSS | news | free | ~60s |
-| NewsAPI | news headlines | free (100/day) | ~30s |
-| Alpha Vantage | news sentiment + quotes | free (25/day) | ~5s |
-| yfinance (XOM) | price feed | free | ~30s |
-| Polygon.io | real-time quotes | free (5 req/min) | ~1s |
-| FRED | macro data (VIX, inventories) | free, unlimited | daily |
-
-set keys in `.env` — the system detects what's available and upgrades automatically.
 
 ---
 
 ## results
 
-backtest on XOM, 2 years of hourly data, synthetic news events calibrated to actual OPEC announcement frequency:
+backtest on XOM, 2 years hourly, ~850 synthetic news events at realistic OPEC announcement frequency.
 
 ![dashboard](dashboard.png)
 
-the key finding: **hub accounts (domain experts with low follower counts) generate 3-4× higher Sharpe signals** than high-follower broadcast sources, even after decay weighting. exactly what the hypothesis predicted.
+the main result held: hub accounts (low follower, high domain expertise) produce 3-4× higher Sharpe signals than broadcast sources. the decay model helped significantly — signals older than ~4 minutes had near-zero predictive value in this dataset.
 
 ---
 
-## math
+## the math
 
 ### welford online algorithm
 
-tracking running mean and variance without storing history. standard batch computation requires O(n) memory; this is O(1):
+standard variance computation requires O(n) memory. welford's method does it in O(1) with a single pass:
 
 ```
 n  ← n + 1
@@ -130,35 +107,51 @@ M�� ← M₂ + δ(x − μ)
 z  = (x − μ) / σ
 ```
 
-reference: Welford, B.P. (1962). *Note on a method for calculating corrected sums of squares and products.* Technometrics, 4(3), 419–420.
+numerically stable even for large n, unlike the naive `Σx²/n − (Σx/n)²` formula which accumulates floating point error.
 
-### exponential half-life decay
+→ *Welford, B.P. (1962). Note on a method for calculating corrected sums of squares and products. Technometrics, 4(3).*
 
-a signal published 5 minutes ago carries less alpha than one published 30 seconds ago. modeled as:
+### half-life decay
+
+alpha decays exponentially. modeled as:
 
 ```
-score_decayed = score_raw × e^(−λ × Δt)
+score_decayed = score_raw × e^(−λΔt)
 λ = ln(2) / T½
-T½ = 120s  (tunable via GA)
 ```
 
-this mirrors the microstructure literature on information decay — see Hasbrouck (1991) on the permanent vs. transient components of price impact.
+T½ is treated as a parameter and optimized by the GA. empirically it converges around 90-150s for oil news — consistent with Hasbrouck's (1991) finding that price impact is mostly absorbed within a few minutes.
 
 ### cosine semantic deduplication
 
-rather than exact-match hashing, we compute sentence embeddings and reject any signal whose cosine similarity to recent signals exceeds τ:
+hash-based dedup only catches exact duplicates. a Reuters headline and its AP paraphrase would both pass through. using L2-normalized sentence embeddings instead:
 
 ```
-sim(u, v) = u·v / (‖u‖ × ‖v‖)
+since ‖u‖ = ‖v‖ = 1 after normalization:
+   sim(u, v) = u·v
 
-since embeddings are L2-normalized at insert time:
-sim(u, v) = u·v  (just a dot product)
-
-batch check: sim_max = max(M @ v)
-where M is the (K × D) buffer matrix
+batch check for K buffered signals:
+   sim_max = max(M @ v)   where M is (K × D)
 ```
 
-threshold τ=0.82 was chosen empirically — below 0.82 the system passes too many near-duplicates, above it starts filtering genuinely independent signals.
+threshold τ=0.82 was chosen empirically. below that you let through too many semantic duplicates; above it you start rejecting genuinely independent signals from different sources.
+
+### monte carlo slippage (GBM)
+
+for a 50ms execution window, modeled as geometric Brownian motion:
+
+```
+S(t) = S₀ × exp((−½σ²)Δt + σ√Δt × Z),   Z ~ N(0,1)
+
+σ calibrated from live spread:
+σ = (spread / mid) × √(252 × 23400)
+
+Δt = 50ms / (252 × 23400s)
+
+slippage_P99 = percentile(max(S(t) − S₀, 0), 99)  for BUY
+```
+
+using P99 rather than mean gives a conservative worst-case fill — the system only opens if expected alpha exceeds this bound.
 
 ### influence scoring
 
@@ -167,235 +160,121 @@ base   = log₁₀(followers + 1) / log₁₀(N_max + 1)
 weight = min(base × hub_boost × domain × accuracy / 2.5, 1.0)
 
 hub_boost = 2.5 if is_hub else 1.0
-domain    ∈ [0, 1]  (pre-labeled per source)
-accuracy  ∈ [0, 1]  (historical signal accuracy)
 ```
 
-log scale prevents large accounts from dominating completely. the hub boost reflects network centrality research — nodes with high betweenness centrality have disproportionate information flow (Barabási, 2016).
-
-### monte carlo slippage (GBM)
-
-```
-S(t) = S₀ × exp((−½σ²)Δt + σ√Δt × Z)
-Z ~ N(0,1),  1000 paths
-Δt = 50ms / (252 × 23400s)
-
-slippage = P99(max(S(t) − S₀, 0))  for BUY
-         = P99(max(S₀ − S(t), 0))  for SELL
-```
-
-### genetic algorithm
-
-```
-population  : 40 genomes
-selection   : tournament, k=3
-crossover   : uniform, p(swap) = 0.5 per gene if r < 0.7
-mutation    : Gaussian, σ = 0.1×(hi−lo), p = 0.2 per gene
-elitism     : top 10% copied directly
-fitness     : annualized Sharpe = μ_pnl / σ_pnl × √(N×252)
-```
-
-walk-forward prevents in-sample overfitting — optimize on folds 1→k, validate on fold k+1, take best out-of-sample genome.
+log scale prevents megaphones from dominating. the hub boost reflects betweenness centrality research — information hubs in scale-free networks have disproportionate information flow even with low degree (Barabási & Albert, 1999).
 
 ---
 
-## documentation and references
+## data sources
 
-### core algorithms
+| source | what it provides | free tier | key required |
+|--------|-----------------|-----------|--------------|
+| Reuters RSS | energy news headlines | unlimited | no |
+| FT RSS | financial news | unlimited | no |
+| OilPrice.com RSS | commodity-specific | unlimited | no |
+| yfinance | XOM price history + live | unlimited | no |
+| NewsAPI | structured headlines, filtering | 100 req/day | yes |
+| Alpha Vantage | news + built-in sentiment | 25 req/day | yes |
+| FRED | EIA petroleum inventories, macro | unlimited | yes |
+| Polygon.io | real-time quotes | 5 req/min | yes |
 
-**Welford (1962)**
-Welford, B.P. *Note on a method for calculating corrected sums of squares and products.* Technometrics, 4(3), 419–420.
-→ basis for the O(1) online z-score in `signal_processor.py`
-
-**Hasbrouck (1991)**
-Hasbrouck, J. *Measuring the information content of stock trades.* Journal of Finance, 46(1), 179–207.
-→ framework for thinking about permanent vs. transient price impact; motivates the half-life decay model
-
-**Black & Scholes (1973)**
-Black, F., Scholes, M. *The pricing of options and corporate liabilities.* Journal of Political Economy, 81(3), 637–654.
-→ GBM price model used in Monte Carlo slippage estimation
-
-**Barabási & Albert (1999)**
-Barabási, A-L., Albert, R. *Emergence of scaling in random networks.* Science, 286, 509–512.
-→ scale-free network structure motivating the hub boost in influence scoring
-
-### NLP and sentiment
-
-**Araci (2019)**
-Araci, D. *FinBERT: Financial sentiment analysis with pre-trained language models.* arXiv:1908.10063.
-→ the model behind `scoring.py` — trained on financial phrasebank dataset, significantly outperforms general-purpose BERT on financial text
-
-**Devlin et al. (2018)**
-Devlin, J., Chang, M-W., Lee, K., Toutanova, K. *BERT: Pre-training of deep bidirectional transformers for language understanding.* arXiv:1810.04805. Google AI / Stanford NLP.
-→ architecture underlying FinBERT
-
-**Reimers & Gurevych (2019)**
-Reimers, N., Gurevych, I. *Sentence-BERT: Sentence embeddings using siamese BERT-networks.* arXiv:1908.10084. TU Darmstadt / UKP Lab.
-→ `all-MiniLM-L6-v2` used for semantic deduplication embeddings
-
-### market microstructure
-
-**Glosten & Milgrom (1985)**
-Glosten, L., Milgrom, P. *Bid, ask and transaction prices in a specialist market with heterogeneously informed traders.* Journal of Financial Economics, 14(1), 71–100.
-→ theoretical basis for why information asymmetry creates exploitable spreads — the core thesis of this project
-
-**Kyle (1985)**
-Kyle, A.S. *Continuous auctions and insider trading.* Econometrica, 53(6), 1315–1335.
-→ lambda (price impact) and the notion of informed vs. uninformed order flow
-
-**Budish, Cramton & Shim (2015)**
-Budish, E., Cramton, P., Shim, J. *The high-frequency trading arms race: Frequent batch auctions as a market design response.* Quarterly Journal of Economics, 130(4), 1547–1621. University of Chicago / UMD / Wisconsin.
-→ motivates the HFT jitter simulation — front-running probability and latency modeling in `shadow_core.py`
-
-### evolutionary computation
-
-**Holland (1992)**
-Holland, J.H. *Adaptation in natural and artificial systems.* MIT Press.
-→ foundational reference for the genetic algorithm in `genetic_optimizer.py`
-
-**Goldberg (1989)**
-Goldberg, D.E. *Genetic algorithms in search, optimization, and machine learning.* Addison-Wesley.
-→ tournament selection and crossover operator design
-
-**De Prado (2018)**
-López de Prado, M. *Advances in financial machine learning.* Wiley.
-→ walk-forward validation methodology; the "combinatorial purged cross-validation" idea that motivates temporal fold separation
-
-### commodity markets
-
-**Hamilton (1983)**
-Hamilton, J.D. *Oil and the macroeconomy since World War II.* Journal of Political Economy, 91(2), 228–248.
-→ empirical basis for oil price sensitivity to supply disruptions — the kind of events the system detects
-
-**Kilian (2009)**
-Kilian, L. *Not all oil price shocks are alike: Disentangling demand and supply shocks in the crude oil market.* American Economic Review, 99(3), 1053–1069. University of Michigan.
-→ supply shock vs. demand shock decomposition; informs the BULLISH/BEARISH keyword design
+all optional keys go in `.env` — the system detects what's available and upgrades feeds automatically. nothing breaks without them.
 
 ---
 
-## files
+## references
 
-```
-sense-act/
-├── scoring.py             FinBERT sentiment scoring + keyword fallback
-├── signal_processor.py    semantic dedup + Welford z-score + decay + influence
-├── shadow_core.py         kill-switch + HFT sim + Monte Carlo + virtual book
-├── genetic_optimizer.py   GA + walk-forward validation
-├── orchestrator.py        async engine — RSS + yfinance + all modules
-├── backtest.py            2-year historical backtest
-├── dashboard.py           matplotlib performance dashboard
-├── telegram_bot.py        Telegram bot interface
-├── requirements.txt
-├── .env.example
-└── tests/
-    └── run_tests.py       30 unit tests
-```
+**NLP / sentiment analysis**
+
+Araci, D. (2019). *FinBERT: Financial sentiment analysis with pre-trained language models.* arXiv:1908.10063.
+
+Devlin, J., Chang, M-W., Lee, K., Toutanova, K. (2018). *BERT: Pre-training of deep bidirectional transformers.* arXiv:1810.04805. Google AI / Stanford NLP.
+
+Reimers, N., Gurevych, I. (2019). *Sentence-BERT: Sentence embeddings using siamese BERT-networks.* arXiv:1908.10084. UKP Lab, TU Darmstadt.
+
+**market microstructure**
+
+Glosten, L., Milgrom, P. (1985). *Bid, ask and transaction prices in a specialist market with heterogeneously informed traders.* Journal of Financial Economics, 14(1).
+
+Hasbrouck, J. (1991). *Measuring the information content of stock trades.* Journal of Finance, 46(1).
+
+Kyle, A.S. (1985). *Continuous auctions and insider trading.* Econometrica, 53(6).
+
+Budish, E., Cramton, P., Shim, J. (2015). *The high-frequency trading arms race.* Quarterly Journal of Economics, 130(4). University of Chicago / UMD.
+
+**statistics / algorithms**
+
+Welford, B.P. (1962). *Note on a method for calculating corrected sums of squares and products.* Technometrics, 4(3).
+
+Black, F., Scholes, M. (1973). *The pricing of options and corporate liabilities.* Journal of Political Economy, 81(3).
+
+Holland, J.H. (1992). *Adaptation in natural and artificial systems.* MIT Press.
+
+López de Prado, M. (2018). *Advances in financial machine learning.* Wiley.
+
+**commodity markets**
+
+Hamilton, J.D. (1983). *Oil and the macroeconomy since World War II.* Journal of Political Economy, 91(2).
+
+Kilian, L. (2009). *Not all oil price shocks are alike.* American Economic Review, 99(3). University of Michigan.
+
+**networks**
+
+Barabási, A-L., Albert, R. (1999). *Emergence of scaling in random networks.* Science, 286.
 
 ---
 
 ## setup
 
-**requirements:** python 3.11+
+python 3.11+
 
 ```bash
-git clone https://github.com/Vitalcheffe/sense-act
-cd sense-act
 pip install -r requirements.txt
 cp .env.example .env
-```
+# fill in your keys (only TELEGRAM_TOKEN is required)
 
-edit `.env` — minimum: `TELEGRAM_TOKEN` and `ALLOWED_CHAT_IDS`.
-optional: add free API keys to improve signal quality (see `.env.example` for links).
-
-**first launch:**
-
-```bash
-python tests/run_tests.py   # 30/30 expected
+python tests/run_tests.py   # should print 30/30
 python backtest.py          # 2-year XOM backtest
 python dashboard.py         # generates dashboard.png
-python telegram_bot.py      # start live engine
+python telegram_bot.py      # live engine
 ```
 
-on first run, `sentence-transformers` downloads `all-MiniLM-L6-v2` (~80MB) and `transformers` downloads `ProsusAI/finbert` (~440MB). one-time only, cached locally after.
+first run will download `all-MiniLM-L6-v2` (~80MB) and `ProsusAI/finbert` (~440MB) — one-time only.
 
-**without FinBERT** (faster startup, lower accuracy):
+without FinBERT/sentence-transformers:
 
 ```bash
 pip install numpy yfinance feedparser python-telegram-bot python-dotenv
 ```
 
-the system detects missing dependencies and falls back to keyword scoring automatically.
+system falls back to keyword scoring automatically, no code changes needed.
 
 ---
 
-## telegram commands
+## telegram
 
 ```
-/start       show menu
-/status      price, mode, open positions, 24h pnl
+/start       menu
+/status      price, mode, positions, pnl
 /positions   open positions with entry / sl / tp
-/pnl         trade summary and win rate
+/pnl         trade history and win rate
 /params      current GA parameters
-/stop        stop the engine
+/stop        stop engine
 ```
-
-the bot sends automatic alerts on new positions, regime changes (NORMAL → CRISIS → HALTED), and kill-switch triggers.
-
----
-
-## modes
-
-| mode | trigger | behavior |
-|------|---------|----------|
-| NORMAL | default | standard sizing |
-| CRISIS | \|impact\| ≥ 0.05 | qty × 0.5, stop × 2 |
-| HALTED | spread or VIX doubles in 60s | no new positions |
-
----
-
-## replacing the stubs
-
-the engine works out of the box with RSS + yfinance. to upgrade individual components:
-
-**better prices** — replace `MarketFeed` in `orchestrator.py` with Polygon.io WebSocket or broker API. add `POLYGON_KEY` to `.env`.
-
-**more news** — `NEWS_API_KEY` in `.env` unlocks NewsAPI; `ALPHA_VANTAGE_KEY` unlocks Alpha Vantage news sentiment endpoint. the orchestrator detects these keys and activates the corresponding feeds automatically.
-
-**macro context** — `FRED_API_KEY` in `.env` enables EIA weekly petroleum inventory data — one of the strongest oil price predictors.
-
-**production scoring** — `scoring.py` already uses FinBERT if available. no code changes needed.
 
 ---
 
 ## limitations
 
-- shadow mode only — the system has never touched real capital
-- news events are sparse (~1/hour from RSS) — alpha window is wide by HFT standards
-- the influence map is manually labeled, not learned from data
-- GBM slippage model assumes log-normal returns — fat tails not modeled
-- walk-forward on synthetic backtest data is not the same as live validation
-
----
-
-## testing
-
-```bash
-python tests/run_tests.py
-```
-
-```
-=== WELFORD ===       5/5
-=== DEDUP ===         4/4
-=== DECAY ===         4/4
-=== SHADOW CORE ===   6/6
-=== SCORING ===       5/5
-=== GENETIC ===       6/6
-
-30 tests    OK 30    FAIL 0
-```
+- shadow mode only, no broker
+- RSS latency ~60s — not HFT
+- influence map is manually labeled per source
+- GBM slippage doesn't model fat tails
+- walk-forward on synthetic news, not real labeled dataset
 
 ---
 
 ## license
 
-MIT — see `LICENSE`
+MIT

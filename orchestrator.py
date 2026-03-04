@@ -1,104 +1,149 @@
 import asyncio
 import logging
-import math
 import time
 from typing import Optional
 
+import feedparser
+import yfinance as yf
 import numpy as np
 
 from signal_processor import SignalProcessor, InfluenceMap, SourceProfile
 from shadow_core import ShadowCore, MarketSnap
 from genetic_optimizer import GeneticOptimizer
+from scoring import score, finbert_active
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger(__name__)
 
 
-def score(text):
-    BULL = ["cut", "shortage", "rally", "surge", "bullish", "deficit", "strong", "increase"]
-    BEAR = ["glut", "crash", "bearish", "oversupply", "drop", "weak", "flood", "sell"]
-    words = [w.strip(".,!?;:") for w in text.lower().split()]
-    p = sum(1 for w in words if w in BULL)
-    n = sum(1 for w in words if w in BEAR)
-    return (p - n) / (p + n) if (p + n) > 0 else 0.0
+RSS_FEEDS = [
+    ("reuters",   2_000_000, False, "https://feeds.reuters.com/reuters/businessNews"),
+    ("ft",        1_500_000, False, "https://www.ft.com/rss/home"),
+    ("oilprice",  500_000,   False, "https://oilprice.com/rss/main"),
+]
 
-
-_FEED = [
-    ("reuters",    2_000_000, False, "OPEC cuts supply deficit bullish"),
-    ("aramco_eng", 200,       True,  "ras tanura pipeline shortage confirmed"),
-    ("oil_trader", 3_500,     False, "crash oversupply bearish"),
-    ("bot_1",      800_000,   False, "oil price up bullish rally strong"),
-    ("bot_2",      750_000,   False, "oil prices rising bullish strong rally"),
-    ("insider",    120,       True,  "OPEC emergency meeting production cut"),
-    ("noise",      50,        False, "great weather today"),
+OIL_KEYWORDS = [
+    "oil", "crude", "opec", "petroleum", "energy", "barrel",
+    "pipeline", "refinery", "brent", "wti", "supply", "production",
+    "natural gas", "lng", "shale",
 ]
 
 
-class MarketFeed:
+def _oil_related(text):
+    t = text.lower()
+    return any(k in t for k in OIL_KEYWORDS)
+
+
+class RSSFeed:
     def __init__(self):
-        self._price = 110.0
-        self._rng   = np.random.default_rng(42)
-        self._vix   = 0.15
+        self._seen = set()
+        self._queue: asyncio.Queue = asyncio.Queue()
 
-    async def next(self) -> MarketSnap:
-        await asyncio.sleep(0.05)
-        self._price *= math.exp(0.0001 + 0.0008 * float(self._rng.standard_normal()))
-        self._vix    = max(0.05, self._vix * 0.99 + 0.01 * abs(float(self._rng.standard_normal())) * 0.1)
-        spread       = self._price * 0.0002 * (1 + self._vix / 10)
-        return MarketSnap("XOM", time.time(), self._price, spread, self._vix)
+    async def poll(self):
+        import hashlib
+        while True:
+            for source, followers, is_hub, url in RSS_FEEDS:
+                try:
+                    feed = await asyncio.get_event_loop().run_in_executor(
+                        None, feedparser.parse, url
+                    )
+                    for entry in feed.entries[:15]:
+                        title   = entry.get("title", "")
+                        summary = entry.get("summary", "")
+                        text    = f"{title} {summary}".strip()
+                        uid     = hashlib.md5(text.encode()).hexdigest()[:12]
 
+                        if uid in self._seen or not _oil_related(text):
+                            continue
 
-class SignalFeed:
-    def __init__(self):
-        self._i   = 0
-        self._rng = np.random.default_rng(7)
+                        self._seen.add(uid)
+                        published = entry.get("published_parsed")
+                        ts = time.mktime(published) if published else time.time()
+                        await self._queue.put((source, followers, is_hub, text, ts))
+                        log.info("new  %-12s  %s", source, title[:70])
+
+                except Exception as e:
+                    log.warning("rss error %s: %s", source, e)
+
+            await asyncio.sleep(60)
 
     async def next(self):
-        await asyncio.sleep(float(self._rng.uniform(0.3, 1.5)))
-        src, fol, hub, text = _FEED[self._i % len(_FEED)]
-        self._i += 1
-        return src, fol, hub, text, time.time() - float(self._rng.uniform(0, 30))
+        return await self._queue.get()
+
+
+class MarketFeed:
+    def __init__(self, ticker="XOM"):
+        self._ticker = ticker
+        self._cache  = None
+        self._last   = 0.0
+
+    async def next(self) -> MarketSnap:
+        now = time.time()
+        if now - self._last > 30:
+            try:
+                data = await asyncio.get_event_loop().run_in_executor(None, self._fetch)
+                if data:
+                    self._cache = data
+                    self._last  = now
+            except Exception as e:
+                log.warning("market feed error: %s", e)
+        await asyncio.sleep(1.0)
+        if self._cache is None:
+            return MarketSnap(self._ticker, time.time(), 110.0, 0.022, 0.18)
+        mid, spread, vix = self._cache
+        return MarketSnap(self._ticker, time.time(), mid, spread, vix)
+
+    def _fetch(self):
+        info   = yf.Ticker(self._ticker).fast_info
+        mid    = float(info.last_price)
+        spread = mid * 0.0002
+        hist   = yf.Ticker(self._ticker).history(period="5d", interval="1h")
+        vix    = 0.20
+        if not hist.empty:
+            rets = hist["Close"].pct_change().dropna()
+            vix  = float(rets.std() * (252 * 6.5) ** 0.5)
+        return mid, spread, vix
 
 
 class Engine:
-    def __init__(self):
+    def __init__(self, ticker="XOM"):
         imap = InfluenceMap()
-        for src, fol, hub, _ in _FEED:
-            imap.add(SourceProfile(src, fol, hub, 0.9 if hub else 0.4, 0.8 if hub else 0.5))
+        for src, fol, hub, _ in RSS_FEEDS:
+            imap.add(SourceProfile(src, fol, hub, 0.7, 0.65))
 
         self.proc   = SignalProcessor(influence_map=imap)
         self.core   = ShadowCore()
         self.opt    = GeneticOptimizer()
-        self._mfeed = MarketFeed()
-        self._sfeed = SignalFeed()
-        self.snap: Optional[MarketSnap] = None
-        self._on  = False
-        self._n   = 0
+        self._mfeed = MarketFeed(ticker)
+        self._sfeed = RSSFeed()
+        self.snap:  Optional[MarketSnap] = None
+        self._on    = False
+        self._n     = 0
 
     async def _market(self):
         while self._on:
             self.snap = await self._mfeed.next()
 
-    async def _signals(self, limit):
-        done = 0
-        while self._on and done < limit:
+    async def _signals(self):
+        while self._on:
             if self.snap is None:
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(0.5)
                 continue
 
             src, fol, hub, text, ts = await self._sfeed.next()
-            s = self.proc.process(text, src, fol, score(text), hub, ts)
+            raw = score(text)
+            s   = self.proc.process(text, src, fol, raw, hub, ts)
             self._n += 1
-            done    += 1
 
             if s.is_duplicate:
-                log.info("dup  %-18s", src)
+                log.info("dup  %-14s", src)
                 continue
 
             flag = "!" if abs(s.impact) >= 0.05 else " "
-            log.info("%s %-18s  raw=%+.2f  decay=%+.3f  w=%.2f  impact=%+.4f",
-                     flag, src, s.raw_score, s.decayed_score, s.influence, s.impact)
+            log.info("%s %-14s  raw=%+.2f  decay=%+.3f  w=%.2f  impact=%+.4f  mode=%s",
+                     flag, src, s.raw_score, s.decayed_score, s.influence, s.impact,
+                     self.core.mode.value)
 
             params = self.opt.params
             if abs(s.impact) > params.sent_thresh:
@@ -111,36 +156,35 @@ class Engine:
                     log.info("  -> [%s] %s @%.4f  sl=%.4f  tp=%.4f",
                              pos.pos_id, pos.side.value, pos.entry, pos.sl, pos.tp)
 
-        self._on = False
-
     async def _mtm(self):
         while self._on:
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(5.0)
             if self.snap and self.core.book.open_count > 0:
                 pnl = self.core.mark(self.snap.mid)
-                log.info("  mtm  price=%.4f  open=%d  pnl=%+.4f",
-                         self.snap.mid, self.core.book.open_count, self.core.book.pnl)
+                log.info("  mtm  price=%.4f  open=%d  pnl=%+.4f  mode=%s",
+                         self.snap.mid, self.core.book.open_count,
+                         self.core.book.pnl, self.core.mode.value)
 
     async def _optimizer(self):
         while self._on:
-            await asyncio.sleep(20.0)
+            await asyncio.sleep(300.0)
             trades = self.core.book.closed
-            if trades:
-                await self.opt.maybe_run(trades)
+            if len(trades) >= 10:
+                g = await self.opt.maybe_run(trades)
+                log.info("  ga  thresh=%.3f  T½=%.0fs  stop=%.2f%%  sharpe=%.4f",
+                         g.sent_thresh, g.half_life, g.stop_pct * 100, g.fitness)
 
-    async def run(self, n=12):
+    async def run(self):
         self._on = True
-        print("\n=== sense-act ===\n")
+        finbert = finbert_active()
+        print(f"\n=== sense-act (live) ===  finbert={'yes' if finbert else 'keywords'}\n")
         async with asyncio.TaskGroup() as tg:
             tg.create_task(self._market())
-            tg.create_task(self._signals(n))
+            tg.create_task(self._signals())
             tg.create_task(self._mtm())
             tg.create_task(self._optimizer())
-        b = self.core.book
-        g = self.opt.params
-        print(f"\nsignals={self._n}  trades={len(b.closed)}  pnl={b.pnl:+.4f}")
-        print(f"ga  thresh={g.sent_thresh:.3f}  T½={g.half_life:.0f}s  stop={g.stop_pct*100:.2f}%\n")
+            tg.create_task(self._sfeed.poll())
 
 
 if __name__ == "__main__":
-    asyncio.run(Engine().run(n=12))
+    asyncio.run(Engine().run())

@@ -4,14 +4,10 @@ import time
 from dataclasses import dataclass
 
 
-BULLISH = [
-    "cut", "shortage", "rally", "surge", "buy", "increase",
-    "deficit", "bullish", "strong", "underproduction"
-]
-BEARISH = [
-    "glut", "drop", "sell", "decrease", "crash",
-    "oversupply", "bearish", "weak", "flood"
-]
+BULLISH = ["cut", "shortage", "rally", "surge", "buy", "increase",
+           "deficit", "bullish", "strong", "underproduction"]
+BEARISH = ["glut", "drop", "sell", "decrease", "crash",
+           "oversupply", "bearish", "weak", "flood"]
 
 
 @dataclass
@@ -30,21 +26,16 @@ class Signal:
 def keyword_score(text):
     if not text or not text.strip():
         return 0.0
-
     words = [w.strip(".,!?;:") for w in text.lower().split()]
     pos = sum(1 for w in words if w in BULLISH)
     neg = sum(1 for w in words if w in BEARISH)
     total = pos + neg
-
     if total == 0:
         return 0.0
-
     return (pos - neg) / total
 
 
 def follower_weight(n):
-    # not sure log is the right scale here but linear felt wrong
-    # reuters at 2M was completely drowning out everyone else
     return min(math.log10(max(n, 1) + 1) / 7.0, 1.0)
 
 
@@ -53,9 +44,8 @@ class SignalProcessor:
         self._seen = set()
 
     def process(self, text, source, followers):
-        uid = hashlib.md5(text.lower().strip().encode()).hexdigest()[:8]
         h = hashlib.md5(text.lower().strip().encode()).hexdigest()
-
+        uid = h[:8]
         is_dup = h in self._seen
         if not is_dup:
             self._seen.add(h)
@@ -72,15 +62,9 @@ class SignalProcessor:
             direction = "NEUTRAL"
 
         return Signal(
-            uid=uid,
-            source=source,
-            followers=followers,
-            text=text,
-            raw_score=raw,
-            weighted_score=weighted,
-            direction=direction,
-            timestamp=time.time(),
-            is_duplicate=is_dup,
+            uid=uid, source=source, followers=followers,
+            text=text, raw_score=raw, weighted_score=weighted,
+            direction=direction, timestamp=time.time(), is_duplicate=is_dup,
         )
 
 
@@ -98,10 +82,8 @@ if __name__ == "__main__":
     ]
 
     print("=== sense-act ===\n")
-
     for source, followers, text in cases:
         s = proc.process(text, source, followers)
         flag = " [dup]" if s.is_duplicate else ""
         print(f"{source}{flag}")
-        print(f"  raw={s.raw_score:+.3f}  w={follower_weight(followers):.2f}  "
-              f"weighted={s.weighted_score:+.3f}  {s.direction}")
+        print(f"  raw={s.raw_score:+.3f}  w={follower_weight(followers):.2f}  weighted={s.weighted_score:+.3f}  {s.direction}")

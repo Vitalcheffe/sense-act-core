@@ -1,0 +1,9 @@
+numpy
+yfinance
+feedparser
+sentence-transformers
+transformers
+torch
+matplotlib
+python-telegram-bot==20.7
+python-dotenv

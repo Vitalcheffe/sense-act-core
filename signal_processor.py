@@ -8,10 +8,9 @@ from typing import Optional
 import numpy as np
 
 
-COSINE_THRESH = 0.95
+COSINE_THRESH = 0.82
 Z_ALERT = 2.5
 HALF_LIFE = 120.0
-EMBED_DIM = 128
 
 
 @dataclass
@@ -36,6 +35,30 @@ class Signal:
     impact: float
     is_duplicate: bool
     timestamp: float
+
+
+_model = None
+
+
+def _get_model():
+    global _model
+    if _model is None:
+        try:
+            from sentence_transformers import SentenceTransformer
+            _model = SentenceTransformer("all-MiniLM-L6-v2")
+        except Exception:
+            _model = "fallback"
+    return _model
+
+
+def _embed(text):
+    m = _get_model()
+    if m != "fallback":
+        v = m.encode(text, convert_to_numpy=True).astype(np.float32)
+    else:
+        seed = int(abs(hash(text)) % (2**31))
+        v = np.random.default_rng(seed).standard_normal(384).astype(np.float32)
+    return v / (np.linalg.norm(v) + 1e-9)
 
 
 class Welford:
@@ -64,12 +87,6 @@ _LAM = math.log(2) / HALF_LIFE
 
 def _decay(ts):
     return math.exp(-_LAM * max(0.0, time.time() - ts))
-
-
-def _embed(text):
-    seed = int(abs(hash(text)) % (2**31))
-    v = np.random.default_rng(seed).standard_normal(EMBED_DIM).astype(np.float32)
-    return v / (np.linalg.norm(v) + 1e-9)
 
 
 class InfluenceMap:
@@ -112,10 +129,9 @@ class SignalProcessor:
         self._imap = influence_map or InfluenceMap()
         self._n_total = 0
         self._n_dupes = 0
-        self._n_regimes = 0
         self._n_anomalies = 0
 
-    def process(self, text, source, followers, score, is_hub=False, ts=None):
+    def process(self, text, source, followers, raw_score, is_hub=False, ts=None):
         t = ts or time.time()
         uid = hashlib.md5(text.encode()).hexdigest()[:8]
         vec = _embed(text)
@@ -125,22 +141,20 @@ class SignalProcessor:
         if is_dup:
             self._n_dupes += 1
             return Signal(uid=uid, source=source, followers=followers, text=text,
-                          raw_score=score, decayed_score=0.0, z_score=0.0,
+                          raw_score=raw_score, decayed_score=0.0, z_score=0.0,
                           influence=0.0, impact=0.0, is_duplicate=True, timestamp=t)
 
-        z = self._welford.update(score)
+        z = self._welford.update(raw_score)
         df = _decay(t)
-        dec = score * df
+        dec = raw_score * df
         w = self._imap.score(source, followers, is_hub)
         impact = dec * w
 
         if abs(z) > Z_ALERT:
             self._n_anomalies += 1
-        if abs(impact) >= 0.05:
-            self._n_regimes += 1
 
         return Signal(uid=uid, source=source, followers=followers, text=text,
-                      raw_score=score, decayed_score=dec, z_score=z,
+                      raw_score=raw_score, decayed_score=dec, z_score=z,
                       influence=w, impact=impact, is_duplicate=False, timestamp=t)
 
     @property
@@ -148,7 +162,6 @@ class SignalProcessor:
         return {
             "total":     self._n_total,
             "dupes":     self._n_dupes,
-            "regimes":   self._n_regimes,
             "anomalies": self._n_anomalies,
             "w_mean":    round(self._welford.mean, 4),
             "w_std":     round(self._welford.std, 4),

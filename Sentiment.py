@@ -3,11 +3,7 @@ import math
 import time
 from dataclasses import dataclass
 
-
-BULLISH = ["cut", "shortage", "rally", "surge", "buy", "increase",
-           "deficit", "bullish", "strong", "underproduction"]
-BEARISH = ["glut", "drop", "sell", "decrease", "crash",
-           "oversupply", "bearish", "weak", "flood"]
+from scoring import _keyword
 
 
 @dataclass
@@ -24,15 +20,8 @@ class Signal:
 
 
 def keyword_score(text):
-    if not text or not text.strip():
-        return 0.0
-    words = [w.strip(".,!?;:") for w in text.lower().split()]
-    pos = sum(1 for w in words if w in BULLISH)
-    neg = sum(1 for w in words if w in BEARISH)
-    total = pos + neg
-    if total == 0:
-        return 0.0
-    return (pos - neg) / total
+    """Alias for scoring._keyword — uses the full keyword list from scoring.py."""
+    return _keyword(text)
 
 
 def follower_weight(n):
